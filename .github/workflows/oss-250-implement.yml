@@ -1,0 +1,67 @@
+name: Implement issue 250
+
+on:
+  push:
+    branches:
+      - fix/250-env-ls-json
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    if: github.event.head_commit.message != '#250: add JSON output to env ls'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Implement issue 250
+        env:
+          BASE_SHA: b76e2425e5043628af775d7783c41a2a892e406a
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/cli/src/main.rs')
+          text = path.read_text()
+
+          old = '''    /// List the project's environments (the active one is marked).\n    Ls,'''
+          new = '''    /// List the project's environments (the active one is marked).\n    Ls {\n        /// Output as a stable JSON array of environment names and active state.\n        #[arg(long)]\n        json: bool,\n    },'''
+          if old not in text:
+              raise SystemExit('EnvCommand::Ls declaration not found')
+          text = text.replace(old, new, 1)
+
+          old = '''            EnvCommand::Ls => {\n                let config = effective_config(&cwd, cli.env.as_deref())?;\n                for env in app.env_list(&config)? {\n                    let marker = if env == config.environment {\n                        theme.marker()\n                    } else {\n                        " ".to_string()\n                    };\n                    println!("{marker} {env}");\n                }\n                Ok(())\n            }'''
+          new = '''            EnvCommand::Ls { json } => {\n                let config = effective_config(&cwd, cli.env.as_deref())?;\n                let environments = app.env_list(&config)?;\n                if json {\n                    println!("{}", env_list_json(&environments, &config.environment)?);\n                } else {\n                    for env in environments {\n                        let marker = if env == config.environment {\n                            theme.marker()\n                        } else {\n                            " ".to_string()\n                        };\n                        println!("{marker} {env}");\n                    }\n                }\n                Ok(())\n            }'''
+          if old not in text:
+              raise SystemExit('EnvCommand::Ls dispatch not found')
+          text = text.replace(old, new, 1)
+
+          marker = '''/// A secret name is usable as an environment variable only if it's a POSIX identifier'''
+          helper = '''fn env_list_json(environments: &[String], active: &str) -> Result<String> {\n    let entries: Vec<_> = environments\n        .iter()\n        .map(|name| serde_json::json!({"name": name, "active": name == active}))\n        .collect();\n    serde_json::to_string(&entries).map_err(|e| Error::Io(e.to_string()))\n}\n\n'''
+          if marker not in text:
+              raise SystemExit('helper insertion marker not found')
+          text = text.replace(marker, helper + marker, 1)
+
+          marker = '''    #[test]\n    fn run_help_explains_command_forwarding() {'''
+          tests = '''    #[test]\n    fn env_ls_json_parser_accepts_flag() {\n        let cli = Cli::try_parse_from(["sotto", "env", "ls", "--json"])\n            .expect("env ls --json should parse");\n        let Command::Env { command: EnvCommand::Ls { json } } = cli.command else {\n            panic!("expected env ls command");\n        };\n        assert!(json);\n    }\n\n    #[test]\n    fn env_ls_json_renders_empty_list() {\n        assert_eq!(super::env_list_json(&[], "dev").unwrap(), "[]");\n    }\n\n    #[test]\n    fn env_ls_json_renders_active_environment() {\n        let rendered = super::env_list_json(\n            &["dev".to_owned(), "staging".to_owned(), "prod".to_owned()],\n            "staging",\n        )\n        .unwrap();\n        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();\n        assert_eq!(\n            value,\n            serde_json::json!([\n                {"name": "dev", "active": false},\n                {"name": "staging", "active": true},\n                {"name": "prod", "active": false}\n            ])\n        );\n        assert!(!rendered.contains("\\x1b"));\n    }\n\n'''
+          if marker not in text:
+              raise SystemExit('test insertion marker not found')
+          text = text.replace(marker, tests + marker, 1)
+
+          text = text.replace('use super::{\n        display_secret, history_line, login_config, set_confirmation, Cli, Command, ThemeCommand,\n    };', 'use super::{\n        display_secret, history_line, login_config, set_confirmation, Cli, Command, EnvCommand,\n        ThemeCommand,\n    };', 1)
+          path.write_text(text)
+          PY
+
+          cargo fmt --all
+          cargo test -p sotto-cli
+
+          git config user.name "Aaqibhafeez Khan"
+          git config user.email "githubaaqibhafeezkhan@gmail.com"
+          git reset --soft "$BASE_SHA"
+          git rm -f .github/workflows/oss-250-implement.yml
+          git add crates/cli/src/main.rs
+          git commit -s -m "#250: add JSON output to env ls"
+          git push --force origin HEAD:fix/250-env-ls-json
