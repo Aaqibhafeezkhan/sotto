@@ -87,6 +87,7 @@ describe("VaultView selection loading", () => {
     vi.mocked(api.fetchProjects).mockResolvedValue([project("project-a"), project("project-b")]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([]);
     vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
     vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
     vi.mocked(vault.decryptSecretName).mockImplementation((_key, _envId, entry) => entry.id);
@@ -188,10 +189,14 @@ describe("VaultView selection loading", () => {
     fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
     const rotateButton = await screen.findByRole("button", { name: "Rotate environment key" });
 
-    fireEvent.click(rotateButton);
-    fireEvent.click(rotateButton);
+    await act(async () => {
+      fireEvent.click(rotateButton);
+      fireEvent.click(rotateButton);
+    });
 
-    expect(api.postRotate).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(api.postRotate).toHaveBeenCalledTimes(1),
+    );
 
     await act(async () => {
       rotation.resolve();
