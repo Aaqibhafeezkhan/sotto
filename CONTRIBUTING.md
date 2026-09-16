@@ -117,6 +117,8 @@ authoritative and wins on any discrepancy; each translation says so in its heade
 cargo test --workspace
 ```
 
+- To run the core codec fuzz smoke checks, follow the [fuzzing guide](.ci/core-fuzz.md).
+
 - When working on server or integration behaviour, use the existing crate test harnesses.
 
 - To collect native Rust coverage with database tests enabled, follow the
@@ -129,6 +131,10 @@ cargo test --workspace
 ```sh
 python3 -B -m unittest discover -s scripts/tests -v
 ```
+
+For the focused encoding and envelope proofs, see the [Kani guide](.ci/kani.md).
+It documents the pinned verifier, reproduction command, input bounds and what the proofs
+do not establish. Keep normal tests alongside those proofs.
 
 ## Supply-chain policy
 

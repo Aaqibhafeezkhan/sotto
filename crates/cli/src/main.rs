@@ -1315,7 +1315,10 @@ fn env_use(store: &Store, cwd: &Path, name: &str) -> Result<()> {
 fn import_dotenv(app: &App, config: &Config, file: &Path) -> Result<()> {
     let text = std::fs::read_to_string(file)
         .map_err(|e| Error::Io(format!("reading {}: {e}", file.display())))?;
-    let pairs = dotenv::parse(&text)?;
+    let pairs = dotenv::parse(&text).map_err(|error| match error {
+        Error::Input(message) => Error::Input(format!("{}: {message}", file.display())),
+        other => other,
+    })?;
     let count = pairs.len();
     for (name, value) in pairs {
         app.set(config, &name, value.as_bytes())?;
@@ -1602,11 +1605,51 @@ fn machine_export(token: &str, format: ExportFormat, reveal: bool) -> Result<()>
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
+    use sotto_cli::commands::App;
+    use sotto_cli::config::Config;
+    use sotto_cli::keychain::MemoryKeychain;
+    use sotto_cli::session;
+    use sotto_cli::store::Store;
+    use sotto_cli::vault::Vault;
+    use std::time::Duration;
 
     use super::{
         display_secret, env_list_json, history_line, login_config, set_confirmation, Cli, Command,
         EnvCommand, ThemeCommand,
     };
+
+    #[test]
+    fn dotenv_import_parse_error_includes_path_and_writes_nothing() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let keychain = MemoryKeychain::default();
+        session::init(&store, &keychain, b"pw", Duration::from_secs(3600))
+            .expect("initialise test identity");
+        let master = session::current_master_key(&keychain)
+            .expect("read session")
+            .expect("unlocked session");
+        let keypair = session::account_keypair(&store, &master).expect("account keypair");
+        let project = Vault::create_project(&store, &keypair, "acme").expect("test project");
+        let config = Config {
+            project_id: project.id,
+            project: "acme".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let app = App::new(&store, &keychain);
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let file = dir.path().join("broken dotenv.env");
+        std::fs::write(&file, "VALID=kept-out\nnot-an-assignment\n").expect("write fixture");
+
+        let error = import_dotenv(&app, &config, &file).expect_err("import must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains(&file.display().to_string()), "{rendered}");
+        assert!(
+            rendered.contains("invalid .env line 2: expected KEY=value"),
+            "{rendered}"
+        );
+        assert_eq!(error.exit_code(), 1);
+        assert!(app.list(&config).expect("list secrets").is_empty());
+    }
 
     #[test]
     fn run_help_explains_command_forwarding() {
