@@ -18,6 +18,11 @@ use crate::founding_allocator;
 use crate::founding_schedule;
 use crate::org;
 
+/// The operator-facing lifetime of a transfer quote. A client cannot extend this by submitting
+/// its own expiry when it creates the invitation.
+pub const TRANSFER_QUOTE_SECONDS: i64 = 15 * 60;
+pub const TRANSFER_QUOTE_VERSION: i64 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferPayer {
     Personal,
@@ -31,6 +36,25 @@ impl TransferPayer {
             Self::Sponsor => "sponsor",
         }
     }
+
+    pub fn parse(value: &str) -> Result<Self, TransferError> {
+        match value {
+            "personal" => Ok(Self::Personal),
+            "sponsor" => Ok(Self::Sponsor),
+            _ => Err(TransferError::InvalidField("payer kind")),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferDraft {
+    pub counterparty_user_id: String,
+    pub beneficiary_id: String,
+    pub destination_kind: TransferPayer,
+    pub destination_organization_id: Option<String>,
+    pub quote_version: i64,
+    pub quote_expires_at_epoch: i64,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +251,8 @@ pub enum BeginTransfer {
 
 #[derive(Debug, Error)]
 pub enum TransferError {
+    #[error("transfer not found")]
+    MissingTransfer,
     #[error("transfer has invalid {0}")]
     InvalidField(&'static str),
     #[error("transfer quote has expired")]
@@ -257,9 +283,277 @@ pub enum TransferError {
     Founding(#[from] founding_allocator::FoundingAllocatorError),
 }
 
+/// Derive and validate a transfer request from local billing state. The caller supplies only the
+/// destination and participants; source payer, offer and effective boundary are server-owned.
+pub async fn build_transfer_request(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_user_id: &str,
+    draft: &TransferDraft,
+    now_epoch: i64,
+) -> Result<TransferRequest, TransferError> {
+    if draft.quote_expires_at_epoch > now_epoch.saturating_add(TRANSFER_QUOTE_SECONDS) {
+        return Err(TransferError::InvalidField("quote expiry"));
+    }
+    if draft.quote_version != TRANSFER_QUOTE_VERSION {
+        return Err(TransferError::InvalidField("quote version"));
+    }
+
+    // Do a read-only authority check before taking the global billing lock. Besides preventing
+    // billing-state disclosure to strangers, this keeps unauthorised quote requests from
+    // serialising every checkout and invoice settlement. Authority is checked again under the
+    // normal locks after source state has been derived below.
+    preauthorise_transfer_draft(tx, actor_user_id, draft, now_epoch).await?;
+    founding_allocator::lock_capacity(tx).await?;
+
+    let personal = sqlx::query_as::<_, (String, Option<i64>)>(
+        "SELECT offer, paid_through_epoch FROM billing_personal_accounts \
+         WHERE user_id = $1 AND state = 'active' AND cancel_at_period_end = FALSE \
+           AND cancellation_requested_at IS NULL AND stripe_subscription_id IS NOT NULL",
+    )
+    .bind(&draft.beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let sponsored = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT seat.organization_id, seat.offer, subscription.current_period_end \
+         FROM billing_sponsored_seats AS seat \
+         JOIN billing_sponsored_subscriptions AS subscription \
+           ON subscription.organization_id = seat.organization_id \
+         WHERE seat.beneficiary_id = $1 AND seat.state = 'active' \
+           AND subscription.status = 'active' \
+           AND subscription.provider_subscription_id IS NOT NULL \
+           AND subscription.current_period_end IS NOT NULL \
+           AND seat.effective_from <= $2 \
+           AND (seat.effective_until IS NULL OR \
+                seat.effective_until >= subscription.current_period_end) \
+         ORDER BY seat.organization_id LIMIT 2",
+    )
+    .bind(&draft.beneficiary_id)
+    .bind(now_epoch)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let (source_kind, source_organization_id, source_offer, effective_from) =
+        match (personal, sponsored.as_slice()) {
+            (Some((offer, Some(boundary))), []) => (TransferPayer::Personal, None, offer, boundary),
+            (None, [(organization_id, offer, boundary)]) => (
+                TransferPayer::Sponsor,
+                Some(organization_id.clone()),
+                offer.clone(),
+                *boundary,
+            ),
+            (None, []) | (Some((_, None)), []) => return Err(TransferError::SourceInactive),
+            _ => return Err(TransferError::CorruptState),
+        };
+
+    let mut request = TransferRequest {
+        actor_user_id: actor_user_id.to_owned(),
+        counterparty_user_id: draft.counterparty_user_id.clone(),
+        beneficiary_id: draft.beneficiary_id.clone(),
+        source_kind,
+        source_organization_id,
+        destination_kind: draft.destination_kind,
+        destination_organization_id: draft.destination_organization_id.clone(),
+        offer: parse_offer(&source_offer)?,
+        quote_version: draft.quote_version,
+        quote_expires_at_epoch: draft.quote_expires_at_epoch,
+        effective_from,
+        effective_until: None,
+        idempotency_key: draft.idempotency_key.clone(),
+    };
+    request.validate_shape()?;
+    authorise_transfer_parties(tx, &request).await?;
+
+    let live_transfer: Option<String> = sqlx::query_scalar(
+        "SELECT transfer_id FROM billing_transfer_intents WHERE beneficiary_id = $1 \
+         AND (state IN ('pending','destination_prepared','destination_paid', \
+                        'source_adjustment_pending','unknown') \
+              OR (state = 'awaiting_consent' AND quote_expires_at_epoch > $2)) \
+         ORDER BY transfer_id LIMIT 1 FOR UPDATE",
+    )
+    .bind(&request.beneficiary_id)
+    .bind(now_epoch)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if live_transfer.is_some() {
+        return Err(TransferError::AlreadyInProgress);
+    }
+
+    let source_offer = ensure_source_active(tx, &request, now_epoch).await?;
+    ensure_no_pending_billing_mutation(tx, &request.beneficiary_id).await?;
+    ensure_destination_free(tx, &request).await?;
+    let award_id: Option<String> = sqlx::query_scalar(
+        "SELECT award_id FROM billing_founding_awards WHERE beneficiary_id = $1",
+    )
+    .bind(&request.beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let award = if let Some(award_id) = award_id.as_deref() {
+        let award = founding_allocator::load_award(tx, award_id)
+            .await?
+            .ok_or(TransferError::CorruptState)?;
+        let (payer_kind, payer_id) = payer_identity(&request, request.source_kind)?;
+        if award.payer_kind != payer_kind || award.payer_id != payer_id {
+            return Err(TransferError::FoundingPayerConflict);
+        }
+        Some(award)
+    } else {
+        None
+    };
+    request.offer =
+        offer_at_transfer_boundary(&source_offer, request.effective_from, award.as_ref())?;
+    request.validate(now_epoch)?;
+    Ok(request)
+}
+
+async fn preauthorise_transfer_draft(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_user_id: &str,
+    draft: &TransferDraft,
+    now_epoch: i64,
+) -> Result<(), TransferError> {
+    // An inactive/missing source is still allowed to reach SourceInactive for its beneficiary.
+    // Otherwise consider the currently active source payer(s), without locking rows or exposing
+    // which one exists to an unauthorised caller.
+    let personal_source: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
+         WHERE user_id = $1 AND state = 'active' AND cancel_at_period_end = FALSE \
+           AND cancellation_requested_at IS NULL AND stripe_subscription_id IS NOT NULL)",
+    )
+    .bind(&draft.beneficiary_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let sponsored_sources: Vec<String> = sqlx::query_scalar(
+        "SELECT seat.organization_id \
+         FROM billing_sponsored_seats AS seat \
+         JOIN billing_sponsored_subscriptions AS subscription \
+           ON subscription.organization_id = seat.organization_id \
+         WHERE seat.beneficiary_id = $1 AND seat.state = 'active' \
+           AND subscription.status = 'active' \
+           AND subscription.provider_subscription_id IS NOT NULL \
+           AND subscription.current_period_end IS NOT NULL \
+           AND seat.effective_from <= $2 \
+           AND (seat.effective_until IS NULL OR \
+                seat.effective_until >= subscription.current_period_end) \
+         ORDER BY seat.organization_id LIMIT 2",
+    )
+    .bind(&draft.beneficiary_id)
+    .bind(now_epoch)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut source_candidates = Vec::new();
+    if personal_source || sponsored_sources.is_empty() {
+        source_candidates.push((TransferPayer::Personal, None));
+    }
+    source_candidates.extend(
+        sponsored_sources
+            .iter()
+            .map(|organization_id| (TransferPayer::Sponsor, Some(organization_id.as_str()))),
+    );
+
+    let mut organization_ids = sponsored_sources
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if draft.destination_kind == TransferPayer::Sponsor {
+        organization_ids.insert(
+            draft
+                .destination_organization_id
+                .as_deref()
+                .ok_or(TransferError::CorruptState)?,
+        );
+    }
+
+    let mut organization_authority = std::collections::BTreeMap::new();
+    for organization_id in organization_ids {
+        for user_id in [actor_user_id, draft.counterparty_user_id.as_str()] {
+            let allowed: bool = sqlx::query_scalar(
+                "SELECT EXISTS( \
+                   SELECT 1 FROM organizations AS o \
+                   JOIN organization_memberships AS m ON m.org_id = o.id \
+                   WHERE o.id = $1 AND m.user_id = $2 \
+                     AND o.lifecycle_state = 'active' AND m.role IN ('owner','admin'))",
+            )
+            .bind(organization_id)
+            .bind(user_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            organization_authority.insert((organization_id, user_id), allowed);
+        }
+    }
+
+    let destination_organization_id = draft.destination_organization_id.as_deref();
+    let permitted = source_candidates
+        .into_iter()
+        .any(|(source_kind, source_org)| {
+            let actor_source = payer_authorised(
+                source_kind,
+                source_org,
+                &draft.beneficiary_id,
+                actor_user_id,
+                &organization_authority,
+            );
+            let actor_destination = payer_authorised(
+                draft.destination_kind,
+                destination_organization_id,
+                &draft.beneficiary_id,
+                actor_user_id,
+                &organization_authority,
+            );
+            let counterparty_source = payer_authorised(
+                source_kind,
+                source_org,
+                &draft.beneficiary_id,
+                &draft.counterparty_user_id,
+                &organization_authority,
+            );
+            let counterparty_destination = payer_authorised(
+                draft.destination_kind,
+                destination_organization_id,
+                &draft.beneficiary_id,
+                &draft.counterparty_user_id,
+                &organization_authority,
+            );
+            (actor_source && counterparty_destination) || (actor_destination && counterparty_source)
+        });
+    permitted.then_some(()).ok_or(TransferError::Unauthorised)
+}
+
+fn offer_at_transfer_boundary(
+    source_offer: &str,
+    effective_from: i64,
+    award: Option<&founding_allocator::FoundingAward>,
+) -> Result<BillingOffer, TransferError> {
+    let source_offer = parse_offer(source_offer)?;
+    let Some(award) = award else {
+        if founding_allocator::FoundingOffer::from_billing_offer(source_offer).is_some() {
+            return Err(TransferError::CorruptState);
+        }
+        return Ok(source_offer);
+    };
+    let founding_end = award
+        .original_end_epoch
+        .ok_or(TransferError::CorruptState)?;
+    let founding_offer = award.offer.billing_offer();
+    let expected_source = if effective_from <= founding_end {
+        founding_offer
+    } else {
+        award.offer.standard_billing_offer()
+    };
+    if source_offer != expected_source {
+        return Err(TransferError::SourceTermChanged);
+    }
+    Ok(if effective_from < founding_end {
+        founding_offer
+    } else {
+        award.offer.standard_billing_offer()
+    })
+}
+
 impl From<TransferError> for Error {
     fn from(error: TransferError) -> Self {
         match error {
+            TransferError::MissingTransfer => Self::NotFound("transfer not found".into()),
             TransferError::InvalidField(field) => {
                 Self::BadRequest(format!("invalid transfer {field}"))
             }
@@ -881,6 +1175,50 @@ pub async fn load_for_actor(
     row.map(|row| transfer_from_row(&row)).transpose()
 }
 
+pub async fn load_for_participant(
+    pool: &PgPool,
+    transfer_id: &str,
+    user_id: &str,
+) -> Result<Option<TransferIntent>, TransferError> {
+    let row = sqlx::query(
+        "SELECT * FROM billing_transfer_intents WHERE transfer_id = $1 \
+         AND (actor_user_id = $2 OR counterparty_user_id = $2)",
+    )
+    .bind(transfer_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| transfer_from_row(&row)).transpose()
+}
+
+pub async fn find_by_idempotency(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_user_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<TransferIntent>, TransferError> {
+    load_by_idempotency(tx, actor_user_id, idempotency_key).await
+}
+
+pub async fn list_for_participant(
+    pool: &PgPool,
+    user_id: &str,
+    before_transfer_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<TransferIntent>, TransferError> {
+    let rows = sqlx::query(
+        "SELECT * FROM billing_transfer_intents \
+         WHERE (actor_user_id = $1 OR counterparty_user_id = $1) \
+           AND ($2::text IS NULL OR transfer_id < $2) \
+         ORDER BY transfer_id DESC LIMIT $3",
+    )
+    .bind(user_id)
+    .bind(before_transfer_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(transfer_from_row).collect()
+}
+
 async fn ensure_source_active(
     tx: &mut Transaction<'_, Postgres>,
     request: &TransferRequest,
@@ -1033,8 +1371,9 @@ async fn load_transfer(
     let row =
         sqlx::query("SELECT * FROM billing_transfer_intents WHERE transfer_id = $1 FOR UPDATE")
             .bind(transfer_id)
-            .fetch_one(&mut **tx)
-            .await?;
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(TransferError::MissingTransfer)?;
     transfer_from_row(&row)
 }
 
@@ -1044,8 +1383,9 @@ async fn load_transfer_snapshot(
 ) -> Result<TransferIntent, TransferError> {
     let row = sqlx::query("SELECT * FROM billing_transfer_intents WHERE transfer_id = $1")
         .bind(transfer_id)
-        .fetch_one(&mut **tx)
-        .await?;
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(TransferError::MissingTransfer)?;
     transfer_from_row(&row)
 }
 
@@ -1154,8 +1494,8 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_offer_at_boundary, validate_source_term, TransferError, TransferPayer,
-        TransferRequest, TransferState,
+        offer_at_transfer_boundary, validate_offer_at_boundary, validate_source_term,
+        TransferError, TransferPayer, TransferRequest, TransferState,
     };
     use crate::billing_catalogue::BillingOffer;
 
@@ -1259,6 +1599,34 @@ mod tests {
         assert!(matches!(
             validate_offer_at_boundary(&transfer, "founding_monthly", Some(&award)),
             Err(TransferError::SourceTermChanged)
+        ));
+    }
+
+    #[test]
+    fn server_derived_offer_keeps_founding_price_only_before_its_original_end() {
+        let award = crate::founding_allocator::FoundingAward {
+            award_id: "award".into(),
+            beneficiary_id: "user".into(),
+            payer_kind: crate::founding_allocator::FoundingPayerKind::Personal,
+            payer_id: "user".into(),
+            offer: crate::founding_allocator::FoundingOffer::Annual,
+            cohort_ordinal: 1,
+            original_start: crate::founding_allocator::FoundingDate::new(2026, 1, 1).unwrap(),
+            original_end: crate::founding_allocator::FoundingDate::new(2027, 1, 1).unwrap(),
+            original_start_epoch: Some(1_000),
+            original_end_epoch: Some(2_000),
+        };
+        assert_eq!(
+            offer_at_transfer_boundary("founding_annual", 1_999, Some(&award)).unwrap(),
+            BillingOffer::FoundingAnnual
+        );
+        assert_eq!(
+            offer_at_transfer_boundary("founding_annual", 2_000, Some(&award)).unwrap(),
+            BillingOffer::StandardAnnual
+        );
+        assert!(matches!(
+            offer_at_transfer_boundary("founding_annual", 2_001, None),
+            Err(TransferError::CorruptState)
         ));
     }
 
