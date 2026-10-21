@@ -348,6 +348,22 @@ pub struct SponsoredCheckoutSession {
     pub subscription_id: Option<String>,
 }
 
+/// The provider resource created for one personal Checkout operation. The session id is kept
+/// separately from its browser URL so recovery and webhooks never have to parse the URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonalCheckoutSession {
+    pub session_id: Option<String>,
+    pub checkout_url: String,
+}
+
+/// Stripe's current status for a previously-created personal Checkout session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonalCheckoutStatus {
+    Open,
+    Complete,
+    ExpiredUnpaid,
+}
+
 /// A beneficiary-authorised Checkout session for saving a payment method before a transfer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferSetupSession {
@@ -523,7 +539,7 @@ pub trait SubscriptionProvider: Send + Sync {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
-    ) -> ProviderResult<String> {
+    ) -> ProviderResult<PersonalCheckoutSession> {
         let _ = (
             price_id,
             operation_id,
@@ -531,8 +547,23 @@ pub trait SubscriptionProvider: Send + Sync {
             idempotency_key,
             expires_at_epoch,
         );
-        self.create_checkout(user_id, customer, success_url, cancel_url)
-            .await
+        let checkout_url = self
+            .create_checkout(user_id, customer, success_url, cancel_url)
+            .await?;
+        Ok(PersonalCheckoutSession {
+            session_id: None,
+            checkout_url,
+        })
+    }
+
+    /// Read a previously-created personal Checkout session before releasing its pending account.
+    /// Implementations must bind the returned resource to both identifiers.
+    async fn get_personal_checkout_status(
+        &self,
+        _session_id: &str,
+        _operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        Err(ProviderError::unsupported("personal_checkout_lookup"))
     }
 
     /// Create the initial named sponsored subscription checkout. All price classes are sent in
@@ -1228,7 +1259,7 @@ impl SubscriptionProvider for StripeBilling {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
-    ) -> ProviderResult<String> {
+    ) -> ProviderResult<PersonalCheckoutSession> {
         if price_id.is_empty() {
             return Err(ProviderError::malformed_response());
         }
@@ -1266,10 +1297,35 @@ impl SubscriptionProvider for StripeBilling {
             idempotency_key,
         )
         .await?;
-        session["url"]
+        let session_id = session["id"]
             .as_str()
-            .map(str::to_string)
-            .ok_or_else(ProviderError::malformed_response)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let checkout_url = session["url"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        Ok(PersonalCheckoutSession {
+            session_id: Some(session_id.to_string()),
+            checkout_url: checkout_url.to_string(),
+        })
+    }
+
+    async fn get_personal_checkout_status(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        if session_id.trim().is_empty() || operation_id.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("checkout/sessions/{session_id}"),
+        )
+        .await?;
+        personal_checkout_status_from_object(&value, session_id, operation_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3203,6 +3259,9 @@ async fn personal_quote(
         .map_err(ProviderError::into_error)?;
     let requested_interval = FoundingOffer::for_billing_offer_interval(requested_offer);
     validate_personal_catalogue(billing, catalogue).await?;
+    reconcile_expired_personal_checkout_once(&state.pool, billing, Some(&user.user_id))
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let now = billing_epoch();
     let expires = now
         .checked_add(founding_allocator::RESERVATION_SECONDS)
@@ -3212,13 +3271,7 @@ async fn personal_quote(
         .await
         .map_err(personal_billing_error)?
     {
-        let reusable = matches!(
-            account.state,
-            personal_billing::PersonalBillingState::Canceled
-        ) || (matches!(
-            account.state,
-            personal_billing::PersonalBillingState::Pending
-        ) && account.pending_expires_at_epoch <= now);
+        let reusable = personal_quote_account_is_reusable(account.state);
         if !reusable {
             return Err(Error::Conflict(
                 "personal billing is already active or pending".into(),
@@ -3284,6 +3337,8 @@ async fn personal_quote(
 /// `POST /billing/personal/checkout` - persist the operation before asking Stripe for a hosted
 /// page. The provider result is the creation of the checkout session; coverage waits for the
 /// verified paid webhook handled below.
+const SAFE_CHECKOUT_IDEMPOTENCY_WINDOW_SECONDS: i64 = 23 * 60 * 60;
+
 async fn personal_checkout(
     State(state): State<AppState>,
     user: AuthUser,
@@ -3315,8 +3370,12 @@ async fn personal_checkout(
     }
     validate_personal_catalogue(billing, catalogue).await?;
     let price_id = catalogue.id_for(offer).to_string();
+    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
     billing_operations::validate_return_url(&billing.return_url, &request.return_url)
         .map_err(Error::from)?;
+    reconcile_expired_personal_checkout_once(&state.pool, billing, Some(&user.user_id))
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let mut tx = state.pool.begin().await?;
     founding_allocator::lock_capacity(&mut tx)
         .await
@@ -3367,6 +3426,15 @@ async fn personal_checkout(
             )
             .await
             .map_err(personal_billing_error)?;
+            let operation = billing_operations::record_personal_checkout_request(
+                &mut tx,
+                &operation.operation_id,
+                &price_id,
+                &success_url,
+                &cancel_url,
+            )
+            .await
+            .map_err(Error::from)?;
             if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
                 let reservation = founding_allocator::reserve_with_payer_kind_until(
                     &mut tx,
@@ -3408,12 +3476,48 @@ async fn personal_checkout(
             // the stored provider idempotency key and ask again only while the operation is still
             // pending and has no recorded checkout URL.
             tx.rollback().await?;
+            if billing_epoch().saturating_sub(operation.created_at_epoch)
+                >= SAFE_CHECKOUT_IDEMPOTENCY_WINDOW_SECONDS
+            {
+                if !billing_operations::park_personal_checkout_outside_idempotency_window(
+                    &state.pool,
+                    &operation.operation_id,
+                )
+                .await
+                .map_err(Error::from)?
+                {
+                    return Err(Error::Conflict(
+                        "billing operation changed while recovery was being reviewed".into(),
+                    ));
+                }
+                let operation = billing_operations::load_operation_for_actor(
+                    &state.pool,
+                    &operation.operation_id,
+                    &user.user_id,
+                )
+                .await
+                .map_err(Error::from)?
+                .ok_or_else(|| Error::NotFound("billing operation not found".into()))?;
+                return Ok(Json(PersonalCheckoutView {
+                    operation_id: operation.operation_id,
+                    state: operation.state.as_str().into(),
+                    checkout_url: operation.provider_checkout_url,
+                }));
+            }
             operation
         }
     };
     let checkout_expires_at_epoch = match checkout_expires_at_epoch {
         Some(expiry) => expiry,
-        None => personal_checkout_expiry(operation.quote_expires_at_epoch, billing_epoch())?,
+        None => personal_checkout_expiry_for_retry(
+            sqlx::query_scalar(
+                "SELECT pending_expires_at_epoch FROM billing_personal_accounts WHERE operation_id = $1",
+            )
+            .bind(&operation.operation_id)
+            .fetch_one(&state.pool)
+            .await?,
+            billing_epoch(),
+        )?,
     };
     let allocation_reference: String = sqlx::query_scalar(
         "SELECT allocation_reference FROM billing_personal_accounts WHERE operation_id = $1",
@@ -3421,31 +3525,47 @@ async fn personal_checkout(
     .bind(&operation.operation_id)
     .fetch_one(&state.pool)
     .await?;
-    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
-    let checkout_url = billing
+    let stored_price_id = operation
+        .provider_checkout_price_id
+        .as_deref()
+        .ok_or_else(|| Error::Conflict("billing operation needs recovery review".into()))?;
+    let stored_success_url = operation
+        .provider_checkout_success_url
+        .as_deref()
+        .ok_or_else(|| Error::Conflict("billing operation needs recovery review".into()))?;
+    let stored_cancel_url = operation
+        .provider_checkout_cancel_url
+        .as_deref()
+        .ok_or_else(|| Error::Conflict("billing operation needs recovery review".into()))?;
+    let checkout = billing
         .provider
         .create_personal_checkout(
             &user.user_id,
             None,
-            &price_id,
+            stored_price_id,
             &operation.operation_id,
             &allocation_reference,
             &operation.provider_idempotency_key,
             checkout_expires_at_epoch,
-            &success_url,
-            &cancel_url,
+            stored_success_url,
+            stored_cancel_url,
         )
         .await
         .map_err(ProviderError::into_error)?;
     let mut result_tx = state.pool.begin().await?;
-    personal_billing::record_checkout_url(&mut result_tx, &operation.operation_id, &checkout_url)
-        .await
-        .map_err(personal_billing_error)?;
+    personal_billing::record_checkout_url(
+        &mut result_tx,
+        &operation.operation_id,
+        checkout.session_id.as_deref(),
+        &checkout.checkout_url,
+    )
+    .await
+    .map_err(personal_billing_error)?;
     let result = billing_operations::record_provider_result(
         &mut result_tx,
         &operation.operation_id,
         BillingOperationState::Succeeded,
-        None,
+        checkout.session_id.as_deref(),
         Some("checkout_created"),
     )
     .await
@@ -3454,8 +3574,389 @@ async fn personal_checkout(
     Ok(Json(PersonalCheckoutView {
         operation_id: result.operation_id,
         state: result.state.as_str().into(),
-        checkout_url: Some(checkout_url),
+        checkout_url: Some(checkout.checkout_url),
     }))
+}
+
+/// Resolve one interrupted personal Checkout creation. The operation's original key and exact
+/// stored request facts are reused only inside a conservative 23-hour window; beyond it the
+/// operation is parked rather than risking Stripe pruning the idempotency key.
+pub async fn recover_personal_billing_operation_once(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+) -> std::result::Result<bool, billing_operations::BillingRecoveryError> {
+    let mut candidates =
+        billing_operations::load_personal_reconciliation_candidates(pool, 1).await?;
+    let Some(candidate) = candidates.pop() else {
+        return reconcile_expired_personal_checkout_once(pool, billing, None).await;
+    };
+    let claim_token = format!("billing-recovery:{}", uuid::Uuid::new_v4());
+    let operation =
+        match billing_operations::claim_reconciliation(pool, &candidate.operation_id, &claim_token)
+            .await
+        {
+            Ok(operation) => operation,
+            Err(billing_operations::BillingRecoveryError::InProgress) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+    if !matches!(
+        operation.state,
+        BillingOperationState::Pending | BillingOperationState::Unknown
+    ) {
+        return Ok(true);
+    }
+    let account = sqlx::query(
+        "SELECT user_id, allocation_reference, offer, stripe_customer_id, state \
+         FROM billing_personal_accounts WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("database_read_failed".into())
+    })?;
+    let Some(account) = account else {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "personal_binding_missing",
+        )
+        .await?;
+        return Ok(true);
+    };
+    let account_state: String = account.try_get("state").map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
+    })?;
+    if account_state == "refund_required" {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "paid_checkout_requires_refund",
+        )
+        .await
+        .map_err(|_| {
+            billing_operations::BillingRecoveryError::Provider(
+                "recovery_review_update_failed".into(),
+            )
+        })?;
+        return Ok(true);
+    }
+    if matches!(account_state.as_str(), "active" | "past_due" | "unpaid") {
+        let mut tx = pool.begin().await.map_err(|_| {
+            billing_operations::BillingRecoveryError::Provider("database_write_failed".into())
+        })?;
+        billing_operations::record_claimed_provider_result(
+            &mut tx,
+            &operation.operation_id,
+            &claim_token,
+            BillingOperationState::Succeeded,
+            operation.provider_operation_id.as_deref(),
+            Some("checkout_settled"),
+        )
+        .await?;
+        tx.commit().await.map_err(|_| {
+            billing_operations::BillingRecoveryError::Provider("database_commit_failed".into())
+        })?;
+        return Ok(true);
+    }
+    let now = billing_epoch();
+    if now.saturating_sub(operation.created_at_epoch) >= SAFE_CHECKOUT_IDEMPOTENCY_WINDOW_SECONDS {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "provider_idempotency_window_elapsed",
+        )
+        .await?;
+        return Ok(true);
+    }
+    let Some(price_id) = operation.provider_checkout_price_id.as_deref() else {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "checkout_price_missing",
+        )
+        .await?;
+        return Ok(true);
+    };
+    let (Some(success_url), Some(cancel_url)) = (
+        operation.provider_checkout_success_url.as_deref(),
+        operation.provider_checkout_cancel_url.as_deref(),
+    ) else {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "checkout_return_urls_missing",
+        )
+        .await?;
+        return Ok(true);
+    };
+    let user_id: String = account.try_get("user_id").map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
+    })?;
+    let allocation_reference: String = account.try_get("allocation_reference").map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
+    })?;
+    let customer_id: Option<String> = account.try_get("stripe_customer_id").map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
+    })?;
+    let expires_at_epoch: i64 = sqlx::query_scalar(
+        "SELECT pending_expires_at_epoch FROM billing_personal_accounts WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
+    })?;
+    let result = billing
+        .provider
+        .create_personal_checkout(
+            &user_id,
+            customer_id.as_deref(),
+            price_id,
+            &operation.operation_id,
+            &allocation_reference,
+            &operation.provider_idempotency_key,
+            expires_at_epoch,
+            success_url,
+            cancel_url,
+        )
+        .await;
+    match result {
+        Ok(session) => {
+            if let Some(session_id) = session.session_id.as_deref() {
+                let mut tx = pool.begin().await.map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "database_write_failed".into(),
+                    )
+                })?;
+                billing_operations::record_claimed_checkout_result(
+                    &mut tx,
+                    &operation.operation_id,
+                    &claim_token,
+                    session_id,
+                    &session.checkout_url,
+                )
+                .await?;
+                tx.commit().await.map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "database_commit_failed".into(),
+                    )
+                })?;
+            } else {
+                billing_operations::park_reconciliation_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &claim_token,
+                    "provider_session_id_missing",
+                )
+                .await?;
+            }
+        }
+        Err(error)
+            if provider_failure_is_definitive(&error)
+                && definitive_checkout_status(error.status) =>
+        {
+            let mut tx = pool.begin().await.map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_write_failed".into())
+            })?;
+            founding_allocator::release_reservation(&mut tx, &operation.operation_id)
+                .await
+                .map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "reservation_release_failed".into(),
+                    )
+                })?;
+            billing_operations::record_claimed_provider_result(
+                &mut tx,
+                &operation.operation_id,
+                &claim_token,
+                BillingOperationState::Failed,
+                None,
+                Some("provider_rejected"),
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE billing_personal_accounts SET state='canceled', updated_at=now() \
+                 WHERE operation_id=$1 AND state='pending'",
+            )
+            .bind(&operation.operation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_account_update_failed".into(),
+                )
+            })?;
+            tx.commit().await.map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_commit_failed".into())
+            })?;
+        }
+        Err(error) if matches!(error.kind, ProviderErrorKind::Authentication) => {
+            billing_operations::park_reconciliation_for_review(
+                pool,
+                &operation.operation_id,
+                &claim_token,
+                "provider_credentials_unavailable",
+            )
+            .await?;
+        }
+        Err(_) => {
+            billing_operations::release_reconciliation_failure(
+                pool,
+                &operation.operation_id,
+                &claim_token,
+                "provider_outcome_uncertain",
+            )
+            .await?;
+        }
+    }
+    Ok(true)
+}
+
+/// Reconcile an expired local pending account against Stripe's current session state. This also
+/// repairs accounts whose signed expiry event was acknowledged by an older server or exhausted
+/// Stripe's webhook retry window.
+async fn reconcile_expired_personal_checkout_once(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+    user_id: Option<&str>,
+) -> std::result::Result<bool, billing_operations::BillingRecoveryError> {
+    let lease_token = format!("billing-expiry-recovery:{}", uuid::Uuid::new_v4());
+    let Some(candidate) =
+        billing_operations::claim_expired_personal_checkout(pool, &lease_token, user_id).await?
+    else {
+        return Ok(false);
+    };
+    let status = billing
+        .provider
+        .get_personal_checkout_status(&candidate.session_id, &candidate.operation_id)
+        .await;
+    match status {
+        Ok(PersonalCheckoutStatus::ExpiredUnpaid) => {
+            let mut tx = pool.begin().await.map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_write_failed".into())
+            })?;
+            founding_allocator::lock_capacity(&mut tx)
+                .await
+                .map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "capacity_lock_failed".into(),
+                    )
+                })?;
+            let account = sqlx::query(
+                "SELECT state, pending_expires_at_epoch, user_id \
+                 FROM billing_personal_accounts WHERE operation_id = $1 FOR UPDATE",
+            )
+            .bind(&candidate.operation_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_read_failed".into())
+            })?;
+            let Some(account) = account else {
+                tx.rollback().await.ok();
+                billing_operations::release_expired_personal_checkout_check(
+                    pool,
+                    &candidate.operation_id,
+                    &candidate.lease_token,
+                )
+                .await?;
+                return Ok(true);
+            };
+            let state: String = account.try_get("state").map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_binding_invalid".into(),
+                )
+            })?;
+            let expires_at: i64 = account.try_get("pending_expires_at_epoch").map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_binding_invalid".into(),
+                )
+            })?;
+            let user_id: String = account.try_get("user_id").map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_binding_invalid".into(),
+                )
+            })?;
+            if state != "pending" || expires_at > billing_epoch() {
+                tx.rollback().await.ok();
+                billing_operations::release_expired_personal_checkout_check(
+                    pool,
+                    &candidate.operation_id,
+                    &candidate.lease_token,
+                )
+                .await?;
+                return Ok(true);
+            }
+            let operation = billing_operations::record_checkout_expired(
+                &mut tx,
+                &candidate.operation_id,
+                &candidate.session_id,
+            )
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("operation_update_failed".into())
+            })?;
+            sqlx::query(
+                "UPDATE billing_personal_accounts SET state='canceled', updated_at=now() \
+                 WHERE operation_id=$1 AND state='pending'",
+            )
+            .bind(&candidate.operation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_account_update_failed".into(),
+                )
+            })?;
+            founding_allocator::release_reservation(&mut tx, &candidate.operation_id)
+                .await
+                .map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "reservation_release_failed".into(),
+                    )
+                })?;
+            crate::notifications::enqueue_checkout_outcome_in_tx(
+                &mut tx,
+                &user_id,
+                &candidate.operation_id,
+                crate::notifications::CheckoutOutcome::Expired,
+            )
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "notification_enqueue_failed".into(),
+                )
+            })?;
+            tx.commit().await.map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_commit_failed".into())
+            })?;
+            let _ = operation;
+        }
+        Ok(PersonalCheckoutStatus::Open | PersonalCheckoutStatus::Complete) => {
+            billing_operations::release_expired_personal_checkout_check(
+                pool,
+                &candidate.operation_id,
+                &candidate.lease_token,
+            )
+            .await?;
+        }
+        Err(_) => {
+            billing_operations::release_expired_personal_checkout_check(
+                pool,
+                &candidate.operation_id,
+                &candidate.lease_token,
+            )
+            .await?;
+        }
+    }
+    Ok(true)
 }
 
 fn personal_checkout_expiry(quote_expires_at_epoch: i64, now_epoch: i64) -> Result<i64> {
@@ -3471,6 +3972,23 @@ fn personal_checkout_expiry(quote_expires_at_epoch: i64, now_epoch: i64) -> Resu
     quote_expires_at_epoch
         .checked_add(founding_allocator::RESERVATION_SECONDS)
         .ok_or_else(|| Error::Internal("billing clock overflow".into()))
+}
+
+fn personal_quote_account_is_reusable(state: personal_billing::PersonalBillingState) -> bool {
+    matches!(state, personal_billing::PersonalBillingState::Canceled)
+}
+
+fn personal_checkout_expiry_for_retry(pending_expiry_epoch: i64, now_epoch: i64) -> Result<i64> {
+    if pending_expiry_epoch <= now_epoch {
+        return Err(Error::Conflict(
+            "personal Checkout has expired; wait for its signed expiry event".into(),
+        ));
+    }
+    Ok(pending_expiry_epoch)
+}
+
+fn definitive_checkout_status(status: Option<u16>) -> bool {
+    matches!(status, Some(400 | 404))
 }
 
 async fn personal_operation(
@@ -4439,6 +4957,29 @@ fn transfer_setup_session_from_object(
         status: status.to_string(),
         expires_at_epoch,
     })
+}
+
+fn personal_checkout_status_from_object(
+    object: &serde_json::Value,
+    expected_session_id: &str,
+    expected_operation_id: &str,
+) -> ProviderResult<PersonalCheckoutStatus> {
+    if object["object"].as_str() != Some("checkout.session")
+        || object["id"].as_str() != Some(expected_session_id)
+        || object["mode"].as_str() != Some("subscription")
+        || object["client_reference_id"].as_str()
+            != Some(format!("personal:{expected_operation_id}").as_str())
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    match (object["status"].as_str(), object["payment_status"].as_str()) {
+        (Some("open"), Some("unpaid")) => Ok(PersonalCheckoutStatus::Open),
+        (Some("complete"), Some("unpaid" | "paid" | "no_payment_required")) => {
+            Ok(PersonalCheckoutStatus::Complete)
+        }
+        (Some("expired"), Some("unpaid")) => Ok(PersonalCheckoutStatus::ExpiredUnpaid),
+        _ => Err(ProviderError::malformed_response()),
+    }
 }
 
 fn transfer_setup_intent_from_object(
@@ -8773,22 +9314,51 @@ async fn sponsored_checkout_expired(
         return Ok(());
     };
     if let Some(operation_id) = reference.strip_prefix("personal:") {
-        let user_id: Option<String> = sqlx::query_scalar(
-            "SELECT user_id FROM billing_personal_accounts WHERE operation_id=$1 AND state='pending'",
+        let session_id = object["id"]
+            .as_str()
+            .filter(|session_id| !session_id.trim().is_empty())
+            .ok_or_else(|| Error::Config("expired Checkout session has no id".into()))?;
+        // Match personal checkout's founding-capacity -> operation/account lock order. Stripe's
+        // signed expiry event is the evidence that permits the pending account to be reused.
+        founding_allocator::lock_capacity(tx)
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        let account_state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM billing_personal_accounts WHERE operation_id=$1 FOR UPDATE",
         )
         .bind(operation_id)
         .fetch_optional(&mut **tx)
         .await?;
-        if let Some(user_id) = user_id {
-            crate::notifications::enqueue_checkout_outcome_in_tx(
-                tx,
-                &user_id,
-                operation_id,
-                crate::notifications::CheckoutOutcome::Expired,
-            )
-            .await
-            .map_err(notification_error)?;
+        if matches!(
+            account_state.as_deref(),
+            Some("active" | "past_due" | "unpaid" | "refund_required")
+        ) {
+            // A paid settlement wins over a delayed expiry delivery.
+            return Ok(());
         }
+        let operation = billing_operations::record_checkout_expired(tx, operation_id, session_id)
+            .await
+            .map_err(Error::from)?;
+        if account_state.as_deref() == Some("pending") {
+            sqlx::query(
+                "UPDATE billing_personal_accounts SET state='canceled', updated_at=now() \
+                 WHERE operation_id=$1 AND state='pending'",
+            )
+            .bind(operation_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+        founding_allocator::release_reservation(tx, operation_id)
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        crate::notifications::enqueue_checkout_outcome_in_tx(
+            tx,
+            &operation.beneficiary_id,
+            operation_id,
+            crate::notifications::CheckoutOutcome::Expired,
+        )
+        .await
+        .map_err(notification_error)?;
         return Ok(());
     }
     if !sponsored_billing_enabled() {
@@ -9867,15 +10437,9 @@ async fn invoice_paid(
         )
         .await
         .map_err(personal_billing_error)?;
-        billing_operations::record_provider_result(
-            tx,
-            &operation_id,
-            billing_operations::BillingOperationState::Succeeded,
-            None,
-            Some("source_restoration_paid"),
-        )
-        .await
-        .map_err(Error::from)?;
+        billing_operations::record_verified_paid_invoice(tx, &operation_id)
+            .await
+            .map_err(Error::from)?;
     } else {
         personal_billing::record_invoice_paid(
             tx,
@@ -13422,6 +13986,88 @@ mod tests {
         );
         assert!(personal_checkout_expiry(now, now).is_err());
         assert!(personal_checkout_expiry(quote_expiry + 1, now).is_err());
+    }
+
+    #[test]
+    fn personal_checkout_expiry_requires_the_exact_unpaid_session_binding() {
+        let expired = serde_json::json!({
+            "object": "checkout.session",
+            "id": "cs_personal",
+            "mode": "subscription",
+            "client_reference_id": "personal:billing:operation",
+            "status": "expired",
+            "payment_status": "unpaid"
+        });
+        assert_eq!(
+            personal_checkout_status_from_object(&expired, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::ExpiredUnpaid
+        );
+        let mut paid = expired.clone();
+        paid["payment_status"] = serde_json::json!("paid");
+        assert!(
+            personal_checkout_status_from_object(&paid, "cs_personal", "billing:operation")
+                .is_err()
+        );
+        assert!(
+            personal_checkout_status_from_object(&expired, "cs_other", "billing:operation")
+                .is_err()
+        );
+        assert!(
+            personal_checkout_status_from_object(&expired, "cs_personal", "billing:other").is_err()
+        );
+        let mut open = expired.clone();
+        open["status"] = serde_json::json!("open");
+        assert_eq!(
+            personal_checkout_status_from_object(&open, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::Open
+        );
+        let mut complete = open;
+        complete["status"] = serde_json::json!("complete");
+        assert_eq!(
+            personal_checkout_status_from_object(&complete, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::Complete
+        );
+        complete["payment_status"] = serde_json::json!("no_payment_required");
+        assert_eq!(
+            personal_checkout_status_from_object(&complete, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::Complete
+        );
+    }
+
+    #[test]
+    fn expired_quote_retries_use_the_existing_checkout_deadline() {
+        let quote_expiry = 100;
+        let now = 110;
+        let original_checkout_expiry = 130;
+        assert!(quote_expiry < now);
+        assert_eq!(
+            personal_checkout_expiry_for_retry(original_checkout_expiry, now).unwrap(),
+            original_checkout_expiry
+        );
+        assert!(personal_checkout_expiry_for_retry(now, now).is_err());
+    }
+
+    #[test]
+    fn expired_pending_personal_accounts_are_not_quote_reusable() {
+        assert!(!personal_quote_account_is_reusable(
+            personal_billing::PersonalBillingState::Pending
+        ));
+        assert!(personal_quote_account_is_reusable(
+            personal_billing::PersonalBillingState::Canceled
+        ));
+    }
+
+    #[test]
+    fn definitive_checkout_status_matches_http_codes_individually() {
+        assert!(definitive_checkout_status(Some(400)));
+        assert!(definitive_checkout_status(Some(404)));
+        assert!(!definitive_checkout_status(Some(401)));
+        assert!(!definitive_checkout_status(Some(500)));
+        assert!(!definitive_checkout_status(None));
     }
 
     #[test]
