@@ -217,7 +217,7 @@ fn paid_invoice() -> Value {
         "customer":"cus_renewal",
         "parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_renewal"}},
         "status":"paid","currency":"gbp","amount_paid":299,"amount_due":299,
-        "amount_overpaid":0,"amount_paid_off_stripe":0,"livemode":false,
+        "amount_overpaid":0,"amount_paid_off_stripe":0,"starting_balance":0,"livemode":false,
         "metadata":{"sotto_allocation_reference":"alloc_renewal"}
     })
 }
@@ -244,7 +244,7 @@ fn generic_open_invoice() -> Value {
         "parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_renewal"}},
         "status":"open","billing_reason":"manual","collection_method":"send_invoice",
         "currency":"gbp","amount_paid":0,"amount_due":299,"amount_remaining":299,
-        "amount_overpaid":0,"amount_paid_off_stripe":0,"livemode":false,
+        "amount_overpaid":0,"starting_balance":0,"livemode":false,
         "metadata":{"sotto_allocation_reference":"alloc_renewal"}
     })
 }
@@ -259,7 +259,7 @@ fn signed_failure() -> Value {
             "status":"open","billing_reason":"subscription_cycle",
             "collection_method":"charge_automatically","currency":"gbp",
             "amount_due":299,"amount_remaining":299,"amount_paid":0,
-            "amount_overpaid":0,"amount_paid_off_stripe":0,"livemode":false,
+            "amount_overpaid":0,"starting_balance":0,"livemode":false,
             "metadata":{"sotto_allocation_reference":"alloc_renewal"},
             "lines":{"object":"list","has_more":false,"data":[{
                 "id":"il_failed","invoice":"in_failed","livemode":false,"quantity":1,
@@ -716,6 +716,44 @@ async fn links_failure_to_exact_paid_predecessor_and_keeps_event_identity_separa
 }
 
 #[tokio::test]
+async fn signed_failure_rejects_nonzero_off_stripe_amount_when_present() {
+    let history = history().await;
+    let mut failure = signed_failure();
+    failure["data"]["object"]["amount_paid_off_stripe"] = json!(1);
+    let (raw, signature) = signed(&failure, NOW);
+    assert!(matches!(
+        decode_personal_renewal_failure(
+            &raw,
+            &signature,
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+            &history,
+        ),
+        Err(StripeContractError::UnsupportedSettlement(_))
+    ));
+
+    failure["data"]["object"]
+        .as_object_mut()
+        .unwrap()
+        .remove("amount_paid_off_stripe");
+    let (raw, signature) = signed(&failure, NOW);
+    assert!(matches!(
+        decode_personal_renewal_failure(
+            &raw,
+            &signature,
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+            &history,
+        ),
+        Ok(StripeRenewalFailureResult::Linked(_))
+    ));
+}
+
+#[tokio::test]
 async fn annual_history_and_signed_failure_keep_annual_price_provenance() {
     let history = history_with_line(paid_line_with("price_year", 1000, 2000)).await;
     let mut failure = signed_failure();
@@ -963,7 +1001,7 @@ fn current_invoice(status: &str) -> Value {
         "collection_method":"charge_automatically","currency":"gbp",
         "amount_paid": if status == "paid" { 299 } else { 0 },"amount_due":299,
         "amount_remaining": if status == "open" { 299 } else { 0 },
-        "amount_overpaid":0,"amount_paid_off_stripe":0,"livemode":false,
+        "amount_overpaid":0,"amount_paid_off_stripe":0,"starting_balance":0,"livemode":false,
         "metadata":{"sotto_allocation_reference":"alloc_renewal"}
     })
 }
@@ -2517,7 +2555,9 @@ async fn open_to_paid_header_transition_returns_changed_fields_without_retrying(
         server
             .requests()
             .iter()
-            .filter(|request| request.starts_with("GET /v1/invoices/in_failed?expand%5B%5D="))
+            .filter(|request| {
+                request.starts_with("GET /v1/invoices/in_failed") && !request.contains("/lines")
+            })
             .count(),
         2
     );

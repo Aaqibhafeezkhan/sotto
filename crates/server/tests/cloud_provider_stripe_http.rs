@@ -11,7 +11,9 @@ use axum::routing::any;
 use axum::Router;
 use serde_json::{json, Value};
 use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
-use sotto_server::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
+use sotto_server::cloud_provider_stripe::{
+    StripeAllocationBinding, StripeContractError, StripeCoverageConfig,
+};
 use sotto_server::cloud_provider_stripe_corrections::{
     evaluate_personal_invoice_access, StripeCorrectionUnresolved,
     StripePersonalInvoiceAccessDecision, StripePersonalInvoiceCorrectionEvidence,
@@ -322,6 +324,32 @@ fn paid_invoice() -> Value {
         "amount_remaining":0,
         "amount_overpaid":0,
         "amount_paid_off_stripe":0,
+        "starting_balance":0,
+        "livemode":false,
+    })
+}
+
+fn open_renewal_invoice() -> Value {
+    json!({
+        "id":"in_1",
+        "customer":"cus_1",
+        "parent":{
+            "type":"subscription_details",
+            "subscription_details":{
+                "subscription":"sub_1",
+                "metadata":{"sotto_allocation_reference":"alloc_1"}
+            }
+        },
+        "status":"open",
+        "billing_reason":"subscription_cycle",
+        "collection_method":"charge_automatically",
+        "currency":"gbp",
+        "amount_paid":0,
+        "amount_due":299,
+        "amount_remaining":299,
+        "amount_overpaid":0,
+        "amount_paid_off_stripe":0,
+        "starting_balance":0,
         "livemode":false,
     })
 }
@@ -576,6 +604,124 @@ async fn assembles_a_personal_invoice_observation_from_complete_reads() {
         observation.evidence_reference(),
         "stripe:invoice:in_1:line:il_1"
     );
+}
+
+#[tokio::test]
+async fn paid_personal_invoice_requests_expanded_off_stripe_amount() {
+    let invoice = paid_invoice();
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(invoice)],
+    );
+    responses.insert(
+        "/v1/invoices/in_1/lines".into(),
+        vec![MockResponse::json(list(vec![personal_line("il_1")], false))],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![MockResponse::json(list(vec![paid_payment()], false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    let observation = client
+        .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+        .await
+        .expect("the detail read includes the expanded off-Stripe amount");
+
+    assert_eq!(observation.invoice_id(), "in_1");
+    assert_eq!(observation.payment_intent_id(), "pi_1");
+    let calls = server.state.calls.lock().unwrap();
+    let detail = calls
+        .iter()
+        .find(|call| call.path_and_query.starts_with("/v1/invoices/in_1?"))
+        .expect("invoice detail was read");
+    assert!(query_pairs(detail)
+        .iter()
+        .any(|(key, value)| key == "expand[]" && value == "amount_paid_off_stripe"));
+}
+
+#[tokio::test]
+async fn renewal_failure_requires_expanded_open_invoice_evidence() {
+    let mut off_stripe_paid = open_renewal_invoice();
+    off_stripe_paid["amount_paid_off_stripe"] = json!(1);
+
+    let mut missing_expanded_amount = open_renewal_invoice();
+    missing_expanded_amount
+        .as_object_mut()
+        .unwrap()
+        .remove("amount_paid_off_stripe");
+
+    let mut missing_amount_due = open_renewal_invoice();
+    missing_amount_due
+        .as_object_mut()
+        .unwrap()
+        .remove("amount_due");
+
+    let missing_required_amounts = [
+        ("amount_remaining", "invoice.amount_remaining"),
+        ("amount_paid", "invoice.amount_paid"),
+        ("amount_overpaid", "invoice.amount_overpaid"),
+        ("starting_balance", "invoice.starting_balance"),
+    ]
+    .into_iter()
+    .map(|(key, field)| {
+        let mut invoice = open_renewal_invoice();
+        invoice.as_object_mut().unwrap().remove(key);
+        (invoice, Err(field))
+    });
+
+    for (invoice, expected) in [
+        (open_renewal_invoice(), Ok(true)),
+        (off_stripe_paid, Ok(false)),
+        (
+            missing_expanded_amount,
+            Err("invoice.amount_paid_off_stripe"),
+        ),
+        (missing_amount_due, Err("invoice.amount_due")),
+    ]
+    .into_iter()
+    .chain(missing_required_amounts)
+    {
+        let mut responses = HashMap::new();
+        responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+        responses.insert(
+            "/v1/invoices/in_1".into(),
+            vec![MockResponse::json(invoice)],
+        );
+        let server = mock_server(responses).await;
+        let client =
+            StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits())
+                .unwrap();
+        let mut session = client.session();
+
+        let result = client
+            .personal_renewal_failure_invoice_is_open_and_unpaid(
+                &mut session,
+                "in_1",
+                &personal_binding(),
+            )
+            .await;
+        match expected {
+            Ok(expected) => assert_eq!(result.unwrap(), expected),
+            Err(field) => assert!(matches!(
+                result,
+                Err(StripeReadError::MalformedResponse(actual)) if actual == field
+            )),
+        }
+        let calls = server.state.calls.lock().unwrap();
+        let detail = calls
+            .iter()
+            .find(|call| call.path_and_query.starts_with("/v1/invoices/in_1?"))
+            .expect("invoice detail was read");
+        assert!(query_pairs(detail)
+            .iter()
+            .any(|(key, value)| key == "expand[]" && value == "amount_paid_off_stripe"));
+    }
 }
 
 #[tokio::test]
@@ -1169,7 +1315,7 @@ async fn reads_all_payment_pages_before_rejecting_ambiguous_settlement() {
             .personal_invoice_observation(&mut session, "in_1", &personal_binding())
             .await,
         Err(StripeReadError::Observation(
-            sotto_server::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(_)
+            StripeContractError::UnsupportedSettlement(_)
         ))
     ));
     assert!(server
@@ -1202,6 +1348,32 @@ async fn rejects_amount_period_and_settlement_contract_violations() {
             sotto_server::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(_)
         ))
     ));
+
+    for (field, value) in [
+        ("amount_paid_off_stripe", json!(1)),
+        ("starting_balance", json!(1)),
+    ] {
+        let mut invoice = paid_invoice();
+        invoice[field] = value;
+        let server = mock_server(observation_responses(
+            invoice,
+            personal_line("il_1"),
+            paid_payment(),
+        ))
+        .await;
+        let client =
+            StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits())
+                .unwrap();
+        let mut session = client.session();
+        assert!(matches!(
+            client
+                .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+                .await,
+            Err(StripeReadError::Observation(
+                sotto_server::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(_)
+            ))
+        ));
+    }
 
     let mut line = personal_line("il_1");
     line["period"]["end"] = json!(1700000000);
@@ -1686,10 +1858,9 @@ async fn collects_all_personal_invoices_under_one_session_and_keeps_non_paid_sta
         .filter(|call| call.path_and_query.starts_with("/v1/invoices/in_1?"))
         .collect();
     assert_eq!(invoice_detail_calls.len(), 1);
-    assert_eq!(
-        query_pairs(invoice_detail_calls[0]),
-        vec![("expand[]".to_owned(), "amount_paid_off_stripe".to_owned())]
-    );
+    assert!(query_pairs(invoice_detail_calls[0])
+        .iter()
+        .any(|(key, value)| key == "expand[]" && value == "amount_paid_off_stripe"));
 }
 
 #[tokio::test]
